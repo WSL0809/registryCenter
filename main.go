@@ -17,6 +17,8 @@ type Service struct {
 	Host          string    `json:"host"`
 	Port          int       `json:"port"`
 	LastHeartbeat time.Time `gorm:"default:CURRENT_TIMESTAMP"`
+	IsHealthy     bool      `gorm:"default:true"`
+	Version       uint      `gorm:"->:false;<-:create;default:1"` // Version is used for optimistic locking.
 }
 
 var db *gorm.DB
@@ -74,7 +76,11 @@ func heartbeatService(c *gin.Context) {
 		return
 	}
 
-	if err := db.Model(&Service{}).Where("name = ?", service.Name).Update("last_heartbeat", time.Now()).Error; err != nil {
+	if err := db.Model(&Service{}).Where("name = ?", service.Name).Updates(map[string]interface{}{
+		"last_heartbeat": time.Now(),
+		"is_healthy":     true,
+		"version":        gorm.Expr("version + 1"),
+	}).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update service heartbeat"})
 		return
 	}
@@ -89,8 +95,19 @@ func checkHeartbeats() {
 		select {
 		case <-ticker.C:
 			var servicesToCheck []Service
-			if err := db.Where("strftime('%s', 'now') - strftime('%s', last_heartbeat) > 300").Find(&servicesToCheck).Error; err != nil {
-				log.Println("Failed to retrieve services for heartbeat check:", err)
+
+			// Initially, mark service as unhealthy
+			if err := db.Model(&Service{}).Where("strftime('%s', 'now') - strftime('%s', last_heartbeat) > 300 AND is_healthy = ?", true).Updates(map[string]interface{}{
+				"is_healthy": false,
+				"version":    gorm.Expr("version + 1"),
+			}).Error; err != nil {
+				log.Println("Failed to mark services as unhealthy:", err)
+				continue
+			}
+
+			// If a service is continuously unhealthy for a certain duration, delete it
+			if err := db.Where("is_healthy = ?", false).Find(&servicesToCheck).Error; err != nil {
+				log.Println("Failed to retrieve unhealthy services:", err)
 				continue
 			}
 
@@ -98,7 +115,6 @@ func checkHeartbeats() {
 				if err := db.Delete(&Service{}, s.ID).Error; err != nil {
 					log.Println("Failed to remove stale service:", s.Name, err)
 				}
-				fmt.Println("keep checking ...")
 			}
 		}
 	}
